@@ -36,6 +36,7 @@ It's a one-shot container: schedule it with Ofelia, cron or similar.
 | `DOCKER_URL` | | `http://pf-socket-proxy:2375` | Docker API endpoint |
 | `STATE_FILE` | | `/state/state.json` | Mount a volume at `/state` |
 | `SETTLE_SECONDS` | | `90` | Wait after restarts before re-probing |
+| `TZ` | | UTC | Timezone for log timestamps, e.g. `Europe/London` |
 
 ## Docker API access
 
