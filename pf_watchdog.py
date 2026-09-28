@@ -10,6 +10,7 @@ import sys
 import tarfile
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 
 OPEN, REFUSED, TIMEOUT, ERROR = "open", "refused", "timeout", "error"
@@ -136,3 +137,40 @@ class Docker:
 
     def restart(self, name, t=10):
         self._request("POST", f"/containers/{name}/restart?t={t}")
+
+
+def push(base_url, status, msg, timeout=10.0):
+    url = f"{base_url}?{urllib.parse.urlencode({'status': status, 'msg': msg, 'ping': ''})}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            resp.read()
+    except OSError as e:
+        log(f"kuma push failed: {e}")
+
+
+@dataclass
+class Config:
+    kuma_push_url: str
+    dependents: tuple  # every container sharing the VPN container's network namespace
+    docker_url: str = "http://pf-socket-proxy:2375"
+    state_file: str = "/state/state.json"
+    gluetun: str = "gluetun"
+    qbittorrent: str = "qbittorrent"
+    settle_seconds: float = 90
+    gluetun_ready_timeout: float = 180
+
+    @classmethod
+    def from_env(cls, env):
+        url = env.get("KUMA_PUSH_URL", "").strip()
+        if not url:
+            raise ValueError("KUMA_PUSH_URL is required")
+        deps = tuple(d.strip() for d in env.get("DEPENDENTS", "").split(",") if d.strip())
+        if not deps:
+            raise ValueError("DEPENDENTS is required (comma-separated container names)")
+        cfg = cls(kuma_push_url=url, dependents=deps)
+        cfg.docker_url = env.get("DOCKER_URL", cfg.docker_url)
+        cfg.state_file = env.get("STATE_FILE", cfg.state_file)
+        cfg.gluetun = env.get("GLUETUN_CONTAINER", cfg.gluetun)
+        cfg.qbittorrent = env.get("QBITTORRENT_CONTAINER", cfg.qbittorrent)
+        cfg.settle_seconds = float(env.get("SETTLE_SECONDS", cfg.settle_seconds))
+        return cfg
