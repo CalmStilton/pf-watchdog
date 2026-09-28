@@ -183,7 +183,12 @@ def read_gluetun(docker, cfg):
 
 
 def reroll_vpn(cfg, docker, *, now, sleep):
-    docker.restart(cfg.gluetun)
+    failed = []
+    try:
+        docker.restart(cfg.gluetun)
+    except DockerError as e:
+        log(f"restart {cfg.gluetun} failed: {e}")
+        failed.append(cfg.gluetun)
     deadline = now() + cfg.gluetun_ready_timeout
     while True:
         try:
@@ -203,7 +208,9 @@ def reroll_vpn(cfg, docker, *, now, sleep):
             docker.restart(name)
         except DockerError as e:
             log(f"restart {name} failed: {e}")
+            failed.append(name)
     sleep(cfg.settle_seconds)
+    return failed
 
 
 def run(cfg, docker, *, now=time.time, sleep=time.sleep, probe=probe, push=push):
@@ -228,9 +235,10 @@ def run(cfg, docker, *, now=time.time, sleep=time.sleep, probe=probe, push=push)
 
     if d.action != "none":
         log(msg)
+        failed = []
         try:
             if d.action == "reroll_vpn":
-                reroll_vpn(cfg, docker, now=now, sleep=sleep)
+                failed = reroll_vpn(cfg, docker, now=now, sleep=sleep)
             else:
                 docker.restart(cfg.qbittorrent)
                 sleep(cfg.settle_seconds)
@@ -241,6 +249,8 @@ def run(cfg, docker, *, now=time.time, sleep=time.sleep, probe=probe, push=push)
                 status, msg = "up", f"recovered on {ip}:{port} after {len(state.remediations)} cycle(s)"
             else:
                 msg += f" – still {after} after remediation"
+            if failed:
+                msg += f" – restart failed: {', '.join(failed)}"
         except (DockerError, ValueError) as e:
             msg += f" – remediation error: {e}"
         save_state(cfg.state_file, state)
