@@ -1,0 +1,129 @@
+import itertools
+import json
+
+import pf_watchdog as wd
+
+CONTROLS = ("1.1.1.1", "portquiz.net")
+DEPS = ("qbittorrent", "app1", "app2")
+
+
+class FakeDocker:
+    def __init__(self, ip="1.2.3.4", port="5000", health="healthy", fail_restart=False):
+        self.files = {"/tmp/gluetun/ip": ip, "/tmp/gluetun/forwarded_port": port} if ip else {}
+        self.health = health
+        self.fail_restart = fail_restart
+        self.restarts = []
+
+    def read_file(self, name, path):
+        assert name == "gluetun"
+        if path not in self.files:
+            raise wd.DockerError("404")
+        return self.files[path]
+
+    def inspect(self, name):
+        return {"State": {"Health": {"Status": self.health}}}
+
+    def restart(self, name, t=10):
+        if self.fail_restart:
+            raise wd.DockerError("403 forbidden")
+        self.restarts.append(name)
+
+
+def make_probe(target_results, controls=wd.OPEN):
+    seq = list(target_results)
+
+    def probe(host, port, timeout=10.0):
+        if host in CONTROLS:
+            return controls
+        return seq.pop(0)
+    return probe
+
+
+def setup(tmp_path, state=None):
+    cfg = wd.Config(kuma_push_url="http://kuma/api/push/t", dependents=DEPS,
+                    state_file=str(tmp_path / "state.json"), settle_seconds=0)
+    if state:
+        wd.save_state(cfg.state_file, state)
+    pushes = []
+    return cfg, pushes, (lambda url, status, msg: pushes.append((status, msg)))
+
+
+def go(cfg, docker, probe, push, now=lambda: 1000.0):
+    return wd.run(cfg, docker, now=now, sleep=lambda s: None, probe=probe, push=push)
+
+
+def test_healthy_run_pushes_up(tmp_path):
+    cfg, pushes, push = setup(tmp_path)
+    docker = FakeDocker()
+    assert go(cfg, docker, make_probe([wd.OPEN]), push) == 0
+    assert pushes == [("up", "open 1.2.3.4:5000")]
+    assert docker.restarts == []
+
+
+def test_inconclusive_pushes_nothing(tmp_path):
+    cfg, pushes, push = setup(tmp_path)
+    docker = FakeDocker()
+    go(cfg, docker, make_probe([wd.TIMEOUT], controls=wd.TIMEOUT), push)
+    assert pushes == []
+    assert docker.restarts == []
+
+
+def test_first_failure_pushes_down_and_records(tmp_path):
+    cfg, pushes, push = setup(tmp_path)
+    docker = FakeDocker()
+    go(cfg, docker, make_probe([wd.TIMEOUT]), push)
+    assert pushes == [("down", "timeout 1.2.3.4:5000 – confirming (1/2)")]
+    assert docker.restarts == []
+    assert wd.load_state(cfg.state_file).consecutive_failures == 1
+
+
+def test_confirmed_timeout_rerolls_and_recovers(tmp_path):
+    cfg, pushes, push = setup(tmp_path, wd.State(consecutive_failures=1))
+    docker = FakeDocker()
+    go(cfg, docker, make_probe([wd.TIMEOUT, wd.OPEN]), push)
+    assert docker.restarts == ["gluetun", *DEPS]
+    assert pushes == [("up", "recovered on 1.2.3.4:5000 after 1 cycle(s)")]
+    assert wd.load_state(cfg.state_file) == wd.State(consecutive_failures=0, remediations=[1000.0])
+
+
+def test_confirmed_refused_restarts_only_qbittorrent(tmp_path):
+    cfg, pushes, push = setup(tmp_path, wd.State(consecutive_failures=1))
+    docker = FakeDocker()
+    go(cfg, docker, make_probe([wd.REFUSED, wd.OPEN]), push)
+    assert docker.restarts == ["qbittorrent"]
+    assert pushes[0][0] == "up"
+
+
+def test_failed_remediation_stays_down(tmp_path):
+    cfg, pushes, push = setup(tmp_path, wd.State(consecutive_failures=1))
+    docker = FakeDocker()
+    go(cfg, docker, make_probe([wd.TIMEOUT, wd.TIMEOUT]), push)
+    assert pushes == [("down", "timeout 1.2.3.4:5000 – restarting gluetun (cycle 1/3)"
+                               " – still timeout after remediation")]
+    assert wd.load_state(cfg.state_file).consecutive_failures == 2
+
+
+def test_unreadable_gluetun_pushes_down_without_remediating(tmp_path):
+    cfg, pushes, push = setup(tmp_path)
+    docker = FakeDocker(ip=None)
+    assert go(cfg, docker, make_probe([]), push) == 1
+    assert pushes[0][0] == "down"
+    assert pushes[0][1].startswith("cannot read gluetun state")
+    assert docker.restarts == []
+
+
+def test_unhealthy_gluetun_still_restarts_dependents(tmp_path):
+    cfg, pushes, push = setup(tmp_path, wd.State(consecutive_failures=1))
+    docker = FakeDocker(health="starting")
+    clock = itertools.count(1000, 10)
+    go(cfg, docker, make_probe([wd.TIMEOUT, wd.TIMEOUT]), push, now=lambda: float(next(clock)))
+    assert docker.restarts == ["gluetun", *DEPS]
+
+
+def test_remediation_error_still_counts_toward_cap(tmp_path):
+    cfg, pushes, push = setup(tmp_path, wd.State(consecutive_failures=1))
+    docker = FakeDocker(fail_restart=True)
+    go(cfg, docker, make_probe([wd.TIMEOUT]), push)
+    assert pushes[0][0] == "down"
+    assert "remediation error" in pushes[0][1]
+    assert json.load(open(cfg.state_file))["remediations"] == [1000.0]

@@ -174,3 +174,87 @@ class Config:
         cfg.qbittorrent = env.get("QBITTORRENT_CONTAINER", cfg.qbittorrent)
         cfg.settle_seconds = float(env.get("SETTLE_SECONDS", cfg.settle_seconds))
         return cfg
+
+
+def read_gluetun(docker, cfg):
+    ip = docker.read_file(cfg.gluetun, "/tmp/gluetun/ip")
+    port = int(docker.read_file(cfg.gluetun, "/tmp/gluetun/forwarded_port"))
+    return ip, port
+
+
+def reroll_vpn(cfg, docker, *, now, sleep):
+    docker.restart(cfg.gluetun)
+    deadline = now() + cfg.gluetun_ready_timeout
+    while True:
+        try:
+            health = docker.inspect(cfg.gluetun)["State"].get("Health", {}).get("Status")
+            if health == "healthy":
+                read_gluetun(docker, cfg)
+                break
+        except (DockerError, ValueError, KeyError):
+            pass
+        if now() >= deadline:
+            log("gluetun not ready before deadline; restarting dependents anyway")
+            break
+        sleep(5)
+    # A gluetun restart orphans its network namespace: every dependent must be restarted.
+    for name in cfg.dependents:
+        try:
+            docker.restart(name)
+        except DockerError as e:
+            log(f"restart {name} failed: {e}")
+    sleep(cfg.settle_seconds)
+
+
+def run(cfg, docker, *, now=time.time, sleep=time.sleep, probe=probe, push=push):
+    state = load_state(cfg.state_file)
+    try:
+        ip, port = read_gluetun(docker, cfg)
+    except (DockerError, ValueError) as e:
+        msg = f"cannot read gluetun state: {e}"
+        log(msg)
+        push(cfg.kuma_push_url, "down", msg)
+        return 1
+
+    target = f"{ip}:{port}"
+    wan = probe("1.1.1.1", 443)
+    egress = probe("portquiz.net", port)
+    result = probe(ip, port)
+    log(f"controls 1.1.1.1:443={wan} portquiz.net:{port}={egress}; target {target}={result}")
+
+    d = decide(state, wan == OPEN and egress == OPEN, result, now(), target)
+    save_state(cfg.state_file, state)
+    status, msg = d.status, d.msg
+
+    if d.action != "none":
+        log(msg)
+        try:
+            if d.action == "reroll_vpn":
+                reroll_vpn(cfg, docker, now=now, sleep=sleep)
+            else:
+                docker.restart(cfg.qbittorrent)
+                sleep(cfg.settle_seconds)
+            ip, port = read_gluetun(docker, cfg)
+            after = probe(ip, port)
+            if after == OPEN:
+                state.consecutive_failures = 0
+                status, msg = "up", f"recovered on {ip}:{port} after {len(state.remediations)} cycle(s)"
+            else:
+                msg += f" – still {after} after remediation"
+        except (DockerError, ValueError) as e:
+            msg += f" – remediation error: {e}"
+        save_state(cfg.state_file, state)
+
+    log(msg)
+    if status:
+        push(cfg.kuma_push_url, status, msg)
+    return 0
+
+
+def main():
+    cfg = Config.from_env(os.environ)
+    return run(cfg, Docker(cfg.docker_url))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
