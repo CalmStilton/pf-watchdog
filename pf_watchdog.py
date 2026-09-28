@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """VPN port-forward watchdog: proves a gluetun forwarded port is reachable
 from the internet, remediates by failure type, and reports to Uptime Kuma."""
+import http.client
+import io
 import json
 import os
 import socket
 import sys
+import tarfile
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 
 OPEN, REFUSED, TIMEOUT, ERROR = "open", "refused", "timeout", "error"
@@ -92,3 +96,43 @@ def decide(state, controls_ok, result, now, target):
                         f"refused {target} – restarting qbittorrent (cycle {cycle}/{CAP})")
     return Decision("reroll_vpn", "down",
                     f"timeout {target} – restarting gluetun (cycle {cycle}/{CAP})")
+
+
+class DockerError(Exception):
+    pass
+
+
+class Docker:
+    """Minimal Docker Engine API client, pointed at pf-socket-proxy."""
+
+    def __init__(self, base_url, timeout=60.0):
+        u = urllib.parse.urlparse(base_url)
+        self.host, self.port, self.timeout = u.hostname, u.port or 2375, timeout
+
+    def _request(self, method, path):
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        try:
+            conn.request(method, path)
+            resp = conn.getresponse()
+            body = resp.read()
+        except OSError as e:
+            raise DockerError(f"{method} {path}: {e}") from e
+        finally:
+            conn.close()
+        if resp.status >= 300:
+            raise DockerError(f"{method} {path} -> {resp.status}: {body[:200]!r}")
+        return body
+
+    def inspect(self, name):
+        return json.loads(self._request("GET", f"/containers/{name}/json"))
+
+    def read_file(self, name, path):
+        body = self._request("GET", f"/containers/{name}/archive?path={urllib.parse.quote(path)}")
+        with tarfile.open(fileobj=io.BytesIO(body)) as tar:
+            member = tar.next()
+            if member is None or not member.isfile():
+                raise DockerError(f"{name}:{path} is not a regular file")
+            return tar.extractfile(member).read().decode().strip()
+
+    def restart(self, name, t=10):
+        self._request("POST", f"/containers/{name}/restart?t={t}")
