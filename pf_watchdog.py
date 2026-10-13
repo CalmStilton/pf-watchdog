@@ -34,8 +34,12 @@ def probe(host, port, timeout=10.0):
 
 
 THRESHOLD = 2
-CAP = 3
+CAP = 6
 WINDOW_SECONDS = 6 * 3600
+# Minimum minutes between remediation n-1 and n (index n-1). A bad VPN reroll is
+# retried quickly at first, then backs off so an outage can't flap the stack.
+GAP_MINUTES = (0, 15, 30, 60, 60, 60)
+GAP_SLACK_SECONDS = 120  # Ofelia's "@every 15m" doesn't fire to the second
 
 
 @dataclass
@@ -89,6 +93,11 @@ def decide(state, controls_ok, result, now, target):
                         f"{kind} {target} – confirming ({state.consecutive_failures}/{THRESHOLD})")
     if len(state.remediations) >= CAP:
         return Decision("none", "down", f"{kind} {target} – capped – manual action needed")
+    if state.remediations:
+        wait = GAP_MINUTES[len(state.remediations)] * 60 - (now - max(state.remediations))
+        if wait > GAP_SLACK_SECONDS:
+            return Decision("none", "down", f"{kind} {target} – next restart in"
+                            f" ~{round(wait / 60)} min (cycle {len(state.remediations) + 1}/{CAP})")
 
     state.remediations.append(now)
     cycle = len(state.remediations)
@@ -158,6 +167,11 @@ class Config:
     qbittorrent: str = "qbittorrent"
     settle_seconds: float = 90
     gluetun_ready_timeout: float = 180
+    history_file: str = ""  # defaults to history.jsonl next to the state file
+
+    def __post_init__(self):
+        if not self.history_file:
+            self.history_file = os.path.join(os.path.dirname(self.state_file), "history.jsonl")
 
     @classmethod
     def from_env(cls, env):
@@ -170,6 +184,8 @@ class Config:
         cfg = cls(kuma_push_url=url, dependents=deps)
         cfg.docker_url = env.get("DOCKER_URL", cfg.docker_url)
         cfg.state_file = env.get("STATE_FILE", cfg.state_file)
+        cfg.history_file = env.get("HISTORY_FILE",
+                                   os.path.join(os.path.dirname(cfg.state_file), "history.jsonl"))
         cfg.gluetun = env.get("GLUETUN_CONTAINER", cfg.gluetun)
         cfg.qbittorrent = env.get("QBITTORRENT_CONTAINER", cfg.qbittorrent)
         cfg.settle_seconds = float(env.get("SETTLE_SECONDS", cfg.settle_seconds))
@@ -180,6 +196,47 @@ def read_gluetun(docker, cfg):
     ip = docker.read_file(cfg.gluetun, "/tmp/gluetun/ip")
     port = int(docker.read_file(cfg.gluetun, "/tmp/gluetun/forwarded_port"))
     return ip, port
+
+
+def read_entry(docker, cfg):
+    """VPN server gluetun connected to (OpenVPN 'remote' address), or None.
+
+    The exit IP doesn't identify the server: one server can exit via several
+    ranges. Recording both is what lets us tell good servers from bad ones."""
+    try:
+        conf = docker.read_file(cfg.gluetun, "/etc/openvpn/target.ovpn")
+    except (DockerError, OSError, ValueError):
+        return None
+    for line in conf.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "remote":
+            return parts[1]
+    return None
+
+
+HISTORY_MAX_LINES = 5000
+
+
+def record_history(path, entry, exit_ip, port, result, now):
+    """Append to the JSONL history only when the server, address, port or result changes."""
+    rec = {"t": now, "entry": entry, "exit": exit_ip, "port": port, "result": result}
+    try:
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            lines = []
+        if lines:
+            last = json.loads(lines[-1])
+            if all(last.get(k) == rec[k] for k in ("entry", "exit", "port", "result")):
+                return
+        lines = (lines + [json.dumps(rec)])[-HISTORY_MAX_LINES:]
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+    except (OSError, ValueError) as e:
+        log(f"history not recorded: {e}")
 
 
 def reroll_vpn(cfg, docker, *, now, sleep):
@@ -224,12 +281,17 @@ def run(cfg, docker, *, now=time.time, sleep=time.sleep, probe=probe, push=push)
         return 1
 
     target = f"{ip}:{port}"
+    entry = read_entry(docker, cfg)
     wan = probe("1.1.1.1", 443)
     egress = probe("portquiz.net", port)
     result = probe(ip, port)
-    log(f"controls 1.1.1.1:443={wan} portquiz.net:{port}={egress}; target {target}={result}")
+    log(f"controls 1.1.1.1:443={wan} portquiz.net:{port}={egress};"
+        f" target {target}={result} (entry {entry or 'unknown'})")
 
-    d = decide(state, wan == OPEN and egress == OPEN, result, now(), target)
+    controls_ok = wan == OPEN and egress == OPEN
+    if controls_ok:  # an inconclusive probe says nothing about the server
+        record_history(cfg.history_file, entry, ip, port, result, now())
+    d = decide(state, controls_ok, result, now(), target)
     save_state(cfg.state_file, state)
     status, msg = d.status, d.msg
 
@@ -244,6 +306,7 @@ def run(cfg, docker, *, now=time.time, sleep=time.sleep, probe=probe, push=push)
                 sleep(cfg.settle_seconds)
             ip, port = read_gluetun(docker, cfg)
             after = probe(ip, port)
+            record_history(cfg.history_file, read_entry(docker, cfg), ip, port, after, now())
             if after == OPEN:
                 state.consecutive_failures = 0
                 status, msg = "up", f"recovered on {ip}:{port} after {len(state.remediations)} cycle(s)"

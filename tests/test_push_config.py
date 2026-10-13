@@ -64,3 +64,10 @@ def test_config_defaults_and_overrides():
     assert cfg.gluetun == "vpn"
     assert cfg.qbittorrent == "qbittorrent"
     assert cfg.settle_seconds == 5.0
+    assert cfg.history_file == "/state/history.jsonl"
+
+
+def test_history_file_follows_state_dir_or_override():
+    base = {"KUMA_PUSH_URL": "http://k/api/push/t", "DEPENDENTS": "a"}
+    assert wd.Config.from_env({**base, "STATE_FILE": "/data/s.json"}).history_file == "/data/history.jsonl"
+    assert wd.Config.from_env({**base, "HISTORY_FILE": "/x/h.jsonl"}).history_file == "/x/h.jsonl"

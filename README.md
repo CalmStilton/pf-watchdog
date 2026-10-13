@@ -18,8 +18,19 @@ Each run:
      2 consecutive failures, restart the torrent client only.
    - **timeout**: the forward is dead. After 2 consecutive failures, restart
      gluetun, then every container in its network namespace.
-4. Caps remediation at 3 cycles per 6 hours.
-5. Reports to an [Uptime Kuma](https://github.com/louislam/uptime-kuma) Push
+4. Limits remediation to 6 cycles per 6 hours, spaced out: a 2nd cycle is
+   allowed 15 minutes after the 1st, a 3rd 30 minutes after the 2nd, and later
+   ones an hour apart (each with 2 minutes' slack for scheduler jitter). A bad
+   VPN reroll usually recovers within the hour, while a real provider outage
+   can't flap the stack indefinitely. While waiting it reports `down` with
+   "next restart in ~N min".
+5. Records which VPN server it connected through (the `remote` in gluetun's
+   `/etc/openvpn/target.ovpn`) alongside the exit IP, port and result, both in
+   the log line and in `history.jsonl` next to the state file. A line is
+   appended only when one of those changes, so the file stays small; it keeps the
+   last 5000 entries. One server can exit through several IP ranges, so this is
+   the evidence for telling servers whose forwards work from ones whose don't.
+6. Reports to an [Uptime Kuma](https://github.com/louislam/uptime-kuma) Push
    monitor (`up`/`down` plus a message). Inconclusive runs push nothing, so set the
    monitor's heartbeat to about 2× the schedule and a dead watchdog alerts too.
 
@@ -35,6 +46,7 @@ It's a one-shot container: schedule it with Ofelia, cron or similar.
 | `QBITTORRENT_CONTAINER` | | `qbittorrent` | |
 | `DOCKER_URL` | | `http://pf-socket-proxy:2375` | Docker API endpoint |
 | `STATE_FILE` | | `/state/state.json` | Mount a volume at `/state` |
+| `HISTORY_FILE` | | `history.jsonl` beside `STATE_FILE` | Server/exit/port/result change log (JSON lines) |
 | `SETTLE_SECONDS` | | `90` | Wait after restarts before re-probing |
 | `TZ` | | UTC | Timezone for log timestamps, e.g. `Europe/London` |
 
