@@ -248,7 +248,7 @@ def run(cfg, docker, *, now=time.time, sleep=time.sleep, probe=probe, push=push)
                 state.consecutive_failures = 0
                 status, msg = "up", f"recovered on {ip}:{port} after {len(state.remediations)} cycle(s)"
             else:
-                msg += f" – still {after} after remediation"
+                msg += f" – still {after} on {ip}:{port} after remediation"
             if failed:
                 msg += f" – restart failed: {', '.join(failed)}"
         except (DockerError, ValueError) as e:

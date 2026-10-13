@@ -8,8 +8,9 @@ DEPS = ("qbittorrent", "app1", "app2")
 
 
 class FakeDocker:
-    def __init__(self, ip="1.2.3.4", port="5000", health="healthy", fail_restart=()):
+    def __init__(self, ip="1.2.3.4", port="5000", health="healthy", fail_restart=(), reroll_to=None):
         self.files = {"/tmp/gluetun/ip": ip, "/tmp/gluetun/forwarded_port": port} if ip else {}
+        self.reroll_to = reroll_to  # (ip, port) gluetun lands on after a restart
         self.health = health
         self.fail_restart = set(fail_restart)
         self.restarts = []
@@ -29,6 +30,9 @@ class FakeDocker:
         if name in self.fail_restart:
             raise wd.DockerError("403 forbidden")
         self.restarts.append(name)
+        if name == "gluetun" and self.reroll_to:
+            ip, port = self.reroll_to
+            self.files.update({"/tmp/gluetun/ip": ip, "/tmp/gluetun/forwarded_port": port})
 
 
 def make_probe(target_results, controls=wd.OPEN):
@@ -101,8 +105,16 @@ def test_failed_remediation_stays_down(tmp_path):
     docker = FakeDocker()
     go(cfg, docker, make_probe([wd.TIMEOUT, wd.TIMEOUT]), push)
     assert pushes == [("down", "timeout 1.2.3.4:5000 – restarting gluetun (cycle 1/3)"
-                               " – still timeout after remediation")]
+                               " – still timeout on 1.2.3.4:5000 after remediation")]
     assert wd.load_state(cfg.state_file).consecutive_failures == 2
+
+
+def test_failed_remediation_names_the_new_target_after_reroll(tmp_path):
+    cfg, pushes, push = setup(tmp_path, wd.State(consecutive_failures=1))
+    docker = FakeDocker(reroll_to=("5.6.7.8", "6000"))
+    go(cfg, docker, make_probe([wd.TIMEOUT, wd.TIMEOUT]), push)
+    assert pushes == [("down", "timeout 1.2.3.4:5000 – restarting gluetun (cycle 1/3)"
+                               " – still timeout on 5.6.7.8:6000 after remediation")]
 
 
 def test_unreadable_gluetun_pushes_down_without_remediating(tmp_path):
@@ -138,7 +150,7 @@ def test_gluetun_restart_failure_still_restarts_dependents(tmp_path):
     assert docker.attempts == ["gluetun", *DEPS]
     assert docker.restarts == list(DEPS)
     assert pushes == [("down", "timeout 1.2.3.4:5000 – restarting gluetun (cycle 1/3)"
-                               " – still timeout after remediation – restart failed: gluetun")]
+                               " – still timeout on 1.2.3.4:5000 after remediation – restart failed: gluetun")]
 
 
 def test_recovery_message_reports_failed_dependent_restarts(tmp_path):
