@@ -80,11 +80,11 @@ class Decision:
 
 def decide(state, controls_ok, result, now, target):
     state.remediations = [t for t in state.remediations if now - t < WINDOW_SECONDS]
-    if not controls_ok:
-        return Decision("none", None, f"inconclusive {target} – control probe failed")
-    if result == OPEN:
+    if result == OPEN:  # a successful connect needs no control to back it up
         state.consecutive_failures = 0
         return Decision("none", "up", f"open {target}")
+    if not controls_ok:
+        return Decision("none", None, f"inconclusive {target} – control probe failed")
 
     state.consecutive_failures += 1
     kind = "refused" if result == REFUSED else "timeout"

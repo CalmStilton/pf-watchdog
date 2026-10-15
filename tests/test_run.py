@@ -76,6 +76,14 @@ def test_inconclusive_pushes_nothing(tmp_path):
     assert docker.restarts == []
 
 
+def test_open_target_pushes_up_when_control_probe_flaps(tmp_path):
+    cfg, pushes, push = setup(tmp_path)
+    docker = FakeDocker()
+    go(cfg, docker, make_probe([wd.OPEN], controls=wd.TIMEOUT), push)
+    assert pushes == [("up", "open 1.2.3.4:5000")]
+    assert docker.restarts == []
+
+
 def test_first_failure_pushes_down_and_records(tmp_path):
     cfg, pushes, push = setup(tmp_path)
     docker = FakeDocker()

@@ -10,6 +10,13 @@ def test_inconclusive_pushes_nothing_and_keeps_counter():
     assert s.consecutive_failures == 1
 
 
+def test_open_target_pushes_up_even_when_controls_fail():
+    s = wd.State(consecutive_failures=1)
+    d = wd.decide(s, False, wd.OPEN, 1000.0, T)
+    assert (d.action, d.status, d.msg) == ("none", "up", f"open {T}")
+    assert s.consecutive_failures == 0
+
+
 def test_open_resets_counter_and_pushes_up():
     s = wd.State(consecutive_failures=1)
     d = wd.decide(s, True, wd.OPEN, 1000.0, T)
